@@ -17,10 +17,11 @@ ERRLOG="$WORK/nc.err"  #netcat stderr for client ip and port
 mkfifo "$FIFO"
 trap 'rm -rf "$WORK"' EXIT #delete temp file
 
-# ---- IP from ifconfig (no hardcoding)
-
-SERVER_IP=$(ifconfig 2>/dev/null | sed -n -e 's/.*inet addr:\([0-9.]*\).*/\1/p'  | grep -v '^127\.' | head -1)
-#finds .*inet addr:\([0-9.]*\).*  replace --> \1 
+# ---- IP from ifconfig (no hardcoding); handles "inet addr:1.2.3.4" and "inet 1.2.3.4" formats ----
+for cmd in ifconfig ss nc curl html2text jq python3; do
+  command -v "$cmd" >/dev/null || echo "WARNING: '$cmd' is not installed (see apk add line at top)" >&2
+done
+SERVER_IP=$(ifconfig 2>/dev/null | sed -n -e 's/.*inet addr:\([0-9.]*\).*/\1/p' -e 's/.*inet \([0-9.]*\) .*/\1/p' | grep -v '^127\.' | head -1)
 
 # Prints the server is running at <IP>, port = {port>
 announce() {
@@ -105,6 +106,64 @@ do_population() {
 
 
 
+# Query the NSW POI layer; stdout = raw JSON. Extra args are more --data-urlencode pairs.
+poi_query() {
+  curl -fsS --max-time 25 -G \
+    --data-urlencode "outFields=poiname,poitype" \
+    --data-urlencode "returnGeometry=true" \
+    --data-urlencode "outSR=4283" \
+    --data-urlencode "f=json" \
+    "$@" "$POI_URL"
+}
+
+# Client sends a POI name (any case) or "lat,lon" (GDA94 degrees, latitude first).
+do_poi() {
+  local raw="$1" name resp x y label count sq
+  if echo "$raw" | grep -qE '^-?[0-9]+(\.[0-9]+)? *, *-?[0-9]+(\.[0-9]+)?$'; then
+    # coordinates: lat,lon
+    y=$(echo "$raw" | cut -d, -f1 | tr -d ' '); x=$(echo "$raw" | cut -d, -f2 | tr -d ' ')
+    label="$y,$x"
+  else
+    # name: the layer stores names in capitals; double any ' for the SQL where-clause
+    name=$(echo "$raw" | tr 'a-z' 'A-Z' | sed "s/'/''/g")
+    resp=$(poi_query --data-urlencode "where=poiname='$name'") \
+      || { err "could not reach the NSW POI service"; return; }
+    if echo "$resp" | jq -e '.error' >/dev/null 2>&1; then
+      err "POI service error: $(echo "$resp" | jq -r '.error.message')"; return
+    fi
+    count=$(echo "$resp" | jq '.features | length' 2>/dev/null)
+    [ "${count:-0}" -gt 0 ] || { err "POI not found: '$raw'"; return; }
+    x=$(echo "$resp" | jq '.features[0].geometry.x'); y=$(echo "$resp" | jq '.features[0].geometry.y')
+    label=$(echo "$resp" | jq -r '.features[0].attributes.poiname')
+  fi
+
+  # everything within POI_DISTANCE_M metres of that point
+  resp=$(poi_query \
+    --data-urlencode "where=1=1" \
+    --data-urlencode "geometry={\"x\":$x,\"y\":$y,\"spatialReference\":{\"wkid\":4283}}" \
+    --data-urlencode "geometryType=esriGeometryPoint" \
+    --data-urlencode "inSR=4283" \
+    --data-urlencode "spatialRel=esriSpatialRelIntersects" \
+    --data-urlencode "distance=$POI_DISTANCE_M" \
+    --data-urlencode "units=esriSRUnit_Meter") \
+    || { err "could not reach the NSW POI service"; return; }
+  if echo "$resp" | jq -e '.error' >/dev/null 2>&1; then
+    err "POI service error: $(echo "$resp" | jq -r '.error.message')"; return
+  fi
+
+  echo "$resp" | jq --arg poi "$label" --argjson x "$x" --argjson y "$y" --argjson d "$POI_DISTANCE_M" '
+    { poi: $poi, centre: {lat: $y, lon: $x}, distance_m: $d,
+      neighbours: [ .features[]
+        | select(((.geometry.x != $x) or (.geometry.y != $y)) or (.attributes.poiname != $poi))
+        | { name: .attributes.poiname, type: .attributes.poitype,
+            lat: .geometry.y, lon: .geometry.x } ],
+      truncated: (.exceededTransferLimit // false) }' > "$WORK/poi.json" \
+    || { err "could not build the neighbours JSON"; return; }
+
+  echo "POI '$label' at lat=$y lon=$x: $(jq '.neighbours | length' "$WORK/poi.json") neighbours within ${POI_DISTANCE_M} m" >&2
+  cat "$WORK/poi.json"
+}
+
 handle() {
   local raw req
   IFS= read -r raw || return
@@ -120,38 +179,6 @@ handle() {
     *)                      do_poi "$raw" ;;         # anything else = a POI name or "lat,lon"
   esac
 }
-
-
-
-#plan 
-#distance = 1000
-#either coordinate or where am i (uppercase tr )
-# x = long, y = lat, 
-# jq to pull from json 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 # Refuse to start if something (e.g. an old copy of this server) already holds the port
 if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${LISTEN_PORT}$"; then
